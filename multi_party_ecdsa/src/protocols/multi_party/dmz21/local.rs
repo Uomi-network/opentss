@@ -17,6 +17,7 @@
 */
 use crate::communication::sending_messages::SendingMessages;
 use crate::protocols::multi_party::dmz21::common::DMZKeyX;
+use crate::protocols::multi_party::dmz21::common::PublicKeyX;
 use crate::protocols::multi_party::dmz21::keygen::KeyGenPhase;
 use crate::protocols::multi_party::dmz21::keygen::Parameters;
 use crate::protocols::multi_party::dmz21::reshare::ReshareKeyPhase;
@@ -35,7 +36,11 @@ use curv::elliptic::curves::secp256_k1::Secp256k1Scalar;
 use curv::elliptic::curves::ECPoint;
 use curv::elliptic::curves::ECScalar;
 use curv::BigInt;
+use rand::Rng;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::thread;
+use std::time::Duration;
 
 /// Local keygen phase
 /// Input
@@ -1587,6 +1592,261 @@ fn generate_router(rx11: Receiver<Vec<u8>>, tx12: Sender<(String, Vec<u8>)>, rx2
     });
     t
 }
+
+fn generate_sender_receiver_map(indexes:Vec<String>) -> HashMap<String, ((Sender<(String, Vec<u8>)>, Receiver<(String, Vec<u8>)>), (Sender<Vec<u8>>, Receiver<Vec<u8>>))> {
+    let mut sender_receiver_map: HashMap<String, ((Sender<(String, Vec<u8>)>, Receiver<(String, Vec<u8>)>), (Sender<Vec<u8>>, Receiver<Vec<u8>>))> = HashMap::new();
+    for i in indexes {
+        let (tx, rx) = unbounded::<(String, Vec<u8>)>();
+        let (tx2, rx2) = unbounded::<Vec<u8>>();
+        sender_receiver_map.insert(i.to_string(), ((tx, rx), (tx2, rx2)));
+    }
+    sender_receiver_map
+}
+
+
+fn generate_multi_router(sender_receiver_map: HashMap<String, ((Sender<(String, Vec<u8>)>, Receiver<(String, Vec<u8>)>), (Sender<Vec<u8>>, Receiver<Vec<u8>>))> ) -> thread::JoinHandle<()> {
+   
+    let t = thread::spawn(move || loop {
+        for i in sender_receiver_map.keys() {
+            if let Ok(recv_message_str) = sender_receiver_map[&i.to_string()].1.1.recv() {
+                let recv_message = bincode::deserialize(&recv_message_str)
+                    .map_err(|why| format_err!("bincode deserialize error: {}", why))
+                    .unwrap();
+                match recv_message {
+                    SendingMessages::P2pMessage(msg) => {
+                        for (key, value) in msg {
+                            if sender_receiver_map.contains_key(&key){
+                                sender_receiver_map[&key].0.0.send((i.to_string(), value.clone())).unwrap();
+                            }
+                        }
+                    }
+                    SendingMessages::BroadcastMessage(msg) => {
+                        for j in sender_receiver_map.keys() {
+                            if sender_receiver_map.contains_key(&j.to_string()){
+                                sender_receiver_map[&j.to_string()].0.0.send((i.to_string(), msg.clone())).unwrap();
+                            }
+
+                        }
+                    }
+                    SendingMessages::SubsetMessage(msg) => {
+                        for j in sender_receiver_map.keys() {
+                            if sender_receiver_map.contains_key(&j.to_string()){
+                                sender_receiver_map[&j.to_string()].0.0.send((i.to_string(), msg.clone())).unwrap();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                break;
+            }
+        }
+
+    });
+
+    t
+}
+
+ #[test]
+ fn test_4_parties() {
+    let start = time::now();
+    let n: usize = 5;
+    let perc = 0.85f32;
+    let t: usize = (perc * n as f32).ceil() as usize;
+    let params = Parameters {
+        threshold: if t < n - 1 {t} else {n -2},
+        share_count: n,
+    };
+
+    println!("Params: {:?}", params);
+
+    let party_ids: Vec<String> = (1..n+1).into_iter().map(|i| i.to_string()).collect();
+
+    
+    let sender_receiver_map = generate_sender_receiver_map(party_ids.clone());
+    let t = generate_multi_router(sender_receiver_map.clone());
+    let _party_ids = party_ids.clone();
+    let _params = params.clone();
+    let mut keygen_threads = BTreeMap::new();
+    for i in 1..n+1 {
+        let tx = sender_receiver_map[&i.to_string()].1.0.clone();
+        let rx = sender_receiver_map[&i.to_string()].0.1.clone();
+        let params = _params.clone();
+        let party_ids = _party_ids.clone();
+        let t = thread::spawn(move || {
+            dmz_multi_keygen_local(
+                i.to_string(),
+                params.clone(),
+                Some(party_ids.clone()),
+                tx,
+                rx,
+            )
+        });
+        keygen_threads.insert(i.to_string(), t);
+    }
+    
+    // let res = t.join().unwrap();
+    // println!("Res: {:?}k", res);
+    let keygen_results: BTreeMap<String, String> = keygen_threads.into_iter().map(|(id, t)| (id, t.join().unwrap())).collect();
+    // let keys: Vec<DMZKeyX> = keygen_results.into_iter().map(|r| serde_json::from_str(&r).unwrap()).collect();
+
+    let end = time::now();
+    let elapsed = end - start;
+    println!("Elapsed time Keygen: {:?}", elapsed);
+
+    let start = time::now();
+
+    // 2. Reshare Phase (remove a random participant and add a new participant with id n + 1)
+    // new_party_ids will be the same as party_ids, but with the random participant removed and n + 1 added.
+    let mut new_party_ids = _party_ids.clone();
+    new_party_ids.pop();
+    new_party_ids.push((n+1).to_string());
+
+
+    
+
+    let new_threshold = _params.threshold;
+    let sender_receiver_map = generate_sender_receiver_map(new_party_ids.clone());
+    let t = generate_multi_router(sender_receiver_map.clone());
+    let _new_party_ids = new_party_ids.clone();
+    let mut reshare_threads = BTreeMap::new();
+    let _keygen_results = keygen_results.clone();
+
+    for i in new_party_ids {
+        let tx = sender_receiver_map[&i.to_string()].1.0.clone();
+        let rx = sender_receiver_map[&i.to_string()].0.1.clone();
+        let party_ids_clone = _party_ids.clone();
+        let new_party_ids_clone = _new_party_ids.clone();
+        let keygen_result = _keygen_results.get(&i.clone()).cloned();
+        let id = i.clone();
+        let t = thread::spawn(move || {
+            dmz_multi_reshare_local(
+                i.clone(),
+                party_ids_clone,
+                new_party_ids_clone,
+                new_threshold,
+                tx,
+                rx,
+                keygen_result,
+            )
+        });
+        reshare_threads.insert(id.clone(), t);
+    }
+    // t.join().unwrap();
+    let reshare_results: BTreeMap<String, String> = reshare_threads.into_iter().map(|(id,t)| (id, t.join().unwrap())).collect();
+
+    let end = time::now();
+    let elapsed = end - start;
+
+    println!("Elapsed time Reshare: {:?}", elapsed);
+    let tmp_key: DMZKeyX = serde_json::from_str(&_keygen_results.get("1").unwrap()).unwrap();
+
+
+
+
+    let pubkey = tmp_key.pubkey.pk.clone();
+    for (id, _) in reshare_results.clone() {
+        let reshare: DMZKeyX = serde_json::from_str(&reshare_results.get(&id).unwrap()).unwrap();
+        assert_eq!(pubkey, reshare.pubkey.pk.clone());
+        if _keygen_results.contains_key(&id) {
+            let key: DMZKeyX = serde_json::from_str(&_keygen_results.get(&id).unwrap()).unwrap();
+            // Check public key consistency.
+            assert_eq!(key.pubkey.pk, reshare.pubkey.pk);
+
+            // Check the pubkey is the same as the one in the keygen phase.
+            assert_eq!(key.pubkey.pk, pubkey);
+        }
+        // Check participant lists.
+        assert_eq!(reshare.participants, _new_party_ids);
+    }
+
+
+    // 3. Do a sign offline measuring time
+    let _params = Parameters {
+        threshold: new_threshold,
+        share_count: n,
+    };
+
+    let _subset = _new_party_ids.clone();
+    let _message = "1234567890abcdef1234567890abcdef".as_bytes().to_vec();
+
+    let start = time::now();
+
+    let mut sign_threads = BTreeMap::new();
+    for i in _new_party_ids.clone() {
+        let tx = sender_receiver_map[&i.to_string()].1.0.clone();
+        let rx = sender_receiver_map[&i.to_string()].0.1.clone();
+        let reshare_result = reshare_results.get(&i).cloned();
+
+        assert!(reshare_result.is_some());
+        let reshare_result = reshare_result.unwrap();
+        let params = _params.clone();
+        let subset = _subset.clone();
+        let message = _message.clone();
+
+        let id = i.clone();
+    
+        let t = thread::spawn(move || {
+            let offline_result = dmz_multi_offline_sign_local(
+                i.clone(),
+                params,
+                subset,
+                tx.clone(),
+                rx.clone(),
+                reshare_result,
+            );
+            offline_result
+        });
+        sign_threads.insert(id, t);
+    }
+
+    let sign_results: BTreeMap<String, String> = sign_threads.into_iter().map(|(id, t)| (id, t.join().unwrap())).collect();
+    // estimate the time taken:
+    let end = time::now();
+    let elapsed = end - start;
+    println!("Elapsed time Offline: {:?}", elapsed);
+
+    // 4. Do a sign online measuring time
+    let start = time::now();
+    let mut sign_threads = BTreeMap::new();
+    for i in _new_party_ids.clone() {
+        let tx = sender_receiver_map[&i.to_string()].1.
+        0.clone();
+        let rx = sender_receiver_map[&i.to_string()].0.1.clone();
+        let offline_result = sign_results.get(&i).cloned();
+        assert!(offline_result.is_some());
+        let id = i.clone();
+
+        let offline_result = offline_result.unwrap();
+        let message = _message.clone();
+        let t = thread::spawn(move || {
+            dmz_multi_online_sign_local(tx, rx, offline_result, message)
+        });
+        sign_threads.insert(id, t);
+
+    }
+
+    let sign_results: BTreeMap<String, String> = sign_threads.into_iter().map(|(id, t)| (id, t.join().unwrap())).collect();
+    // estimate the time taken:
+    let end = time::now();
+    let elapsed = end - start;
+    println!("Elapsed time Online: {:?}", elapsed);
+
+    // // 5. Verify the signature
+    // let mut sigs = BTreeMap::new();
+    // for (id, sig) in sign_results.clone() {
+    //     let sig = bincode::deserialize(&sig).unwrap();
+    //     sigs.insert(id, sig);
+    // }
+
+    // let mut sigs: BTreeMap<String, Vec<u8>> = sigs.into_iter().map(|(id, sig)| (id, sig)).collect();
+
+    
+
+
+}
+
+
 
 
 fn generate_router_4(
